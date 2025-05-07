@@ -14,6 +14,10 @@ using namespace std::chrono_literals;
 #endif
 
 
+#define TENSOR_NORMALISE_OP_CST_1 0.1307
+#define TENSOR_NORMALISE_OP_CST_2 0.3081
+
+
 //
 
 
@@ -87,7 +91,8 @@ int main(int argc, char *argv[])
     // Read train dataset
     const char *kDataRoot     = "./dataset/dataset/";
     auto        train_dataset = torch::data::datasets::MNIST(kDataRoot)
-                             .map(torch::data::transforms::Normalize<>(0.1307, 0.3081))
+                             .map(torch::data::transforms::Normalize<>(TENSOR_NORMALISE_OP_CST_1,
+                                                                       TENSOR_NORMALISE_OP_CST_2))
                              .map(torch::data::transforms::Stack<>());
 
 #ifndef SERIALISED_VERSION
@@ -195,7 +200,8 @@ int main(int argc, char *argv[])
     if (rank == 0) {
         auto test_dataset =
             torch::data::datasets::MNIST(kDataRoot, torch::data::datasets::MNIST::Mode::kTest)
-                .map(torch::data::transforms::Normalize<>(0.1307, 0.3081))
+                .map(torch::data::transforms::Normalize<>(TENSOR_NORMALISE_OP_CST_1,
+                                                          TENSOR_NORMALISE_OP_CST_2))
                 .map(torch::data::transforms::Stack<>());
 
         auto num_test_samples = test_dataset.size().value();
