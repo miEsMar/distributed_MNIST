@@ -1,9 +1,13 @@
-#define USE_C10D_MPI
+// MNIST model trainig example
 #include <iostream>
 #include <torch/csrc/api/include/torch/torch.h>
-#include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
-#include <torch/csrc/distributed/c10d/ProcessGroupMPI.hpp>
-#include <torch/csrc/distributed/c10d/Work.hpp>
+
+#ifndef SERIALISED_VERSION
+# define USE_C10D_MPI
+# include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
+# include <torch/csrc/distributed/c10d/ProcessGroupMPI.hpp>
+# include <torch/csrc/distributed/c10d/Work.hpp>
+#endif
 
 
 #define PROVIDE_TIMING
@@ -17,6 +21,10 @@ using namespace std::chrono_literals;
 #define TENSOR_NORMALISE_OP_CST_1 0.1307
 #define TENSOR_NORMALISE_OP_CST_2 0.3081
 
+
+#define CHRONO_SECONDS_TO_DOUBLE(t)                                                                \
+    (double)((double)std::chrono::duration_cast<std::chrono::seconds>(t).count() +                 \
+             1e-3 * (double)std::chrono::duration_cast<std::chrono::milliseconds>(t % 1s).count())
 
 //
 
@@ -79,7 +87,9 @@ int main(int argc, char *argv[])
     const auto numranks = pg->getSize();
     const auto rank     = pg->getRank();
 
-    fprintf(stdout, "\n ****  DISTRIBUTED  MNIST  toy model  ****\n\n");
+    if (0 == rank) {
+        fprintf(stdout, "\n ****  DISTRIBUTED  MNIST  toy model  ****\n\n");
+    }
 #else
     constexpr auto numranks = 1;
     constexpr auto rank     = 0;
@@ -189,9 +199,7 @@ int main(int argc, char *argv[])
         auto end_train_time = hr_clock.now();
 
         auto train_time = end_train_time - init_train_time;
-        fprintf(stdout, "%s%4ld.%3ld s\n", "Training time:",
-                std::chrono::duration_cast<std::chrono::seconds>(train_time).count(),
-                std::chrono::duration_cast<std::chrono::milliseconds>(train_time % 1s).count());
+        fprintf(stdout, "%s  %7.3lf s\n", "Training time:", CHRONO_SECONDS_TO_DOUBLE(train_time));
     }
 #endif
 
