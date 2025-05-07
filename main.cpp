@@ -65,22 +65,6 @@ struct Model : torch::nn::Module {
 };
 
 
-#ifndef SERIALISED_VERSION
-void waitWork(c10::intrusive_ptr<c10d::ProcessGroupMPI>   pg,
-              std::vector<c10::intrusive_ptr<c10d::Work>> works)
-{
-    for (auto &work : works) {
-        try {
-            work->wait();
-        } catch (const std::exception &ex) {
-            std::cerr << "Exception received: " << ex.what() << std::endl;
-            pg->abort();
-        }
-    }
-}
-#endif
-
-
 int main(int argc, char *argv[])
 {
 #ifndef SERIALISED_VERSION
@@ -133,7 +117,17 @@ int main(int argc, char *argv[])
 
 #if (defined(PROVIDE_TIMING))
     auto hr_clock        = std::chrono::high_resolution_clock();
-    auto init_train_time = hr_clock.now();
+    auto init_time       = hr_clock.now();
+    auto init_train_time = init_time;
+    auto end_train_time  = init_train_time;
+    auto end_time        = end_train_time;
+
+# ifndef SERIALISED_VERSION
+    std::chrono::duration<double> time_allreduce_plus_wait;
+    std::chrono::duration<double> time_allreduce;
+    std::chrono::duration<double> time_dummy_compute;
+    std::chrono::duration<double> time_waitall;
+# endif
 #endif
 
     constexpr size_t num_epochs = 10;
@@ -163,16 +157,31 @@ int main(int argc, char *argv[])
             // Averaging the gradients of the parameters in all the processors
             // Note: This may lag behind DistributedDataParallel (DDP) in performance
             // since this synchronizes parameters after backward pass while DDP
-            // overlaps synchronizing parameters and computing gradients in backward
-            // pass
+            // overlaps synchronizing parameters and computing gradients in backward pass.
+
+            auto ts = hr_clock.now();
+
             std::vector<c10::intrusive_ptr<::c10d::Work>> works;
             for (auto &param : model->named_parameters()) {
                 std::vector<torch::Tensor> tmp  = {param.value().grad()};
+                auto                       ti   = hr_clock.now();
                 auto                       work = pg->allreduce(tmp);
+                time_allreduce += hr_clock.now() - ti;
                 works.push_back(std::move(work));
             }
 
-            waitWork(pg, works);
+            auto ti = hr_clock.now();
+            for (auto &work : works) {
+                try {
+                    work->wait();
+                } catch (const std::exception &ex) {
+                    std::cerr << "Exception received: " << ex.what() << std::endl;
+                    pg->abort();
+                }
+            }
+            auto te = hr_clock.now();
+            time_waitall += te - ti;
+            time_allreduce_plus_wait += te - ts;
 
             for (auto &param : model->named_parameters()) {
                 param.value().grad().data() = param.value().grad().data() / numranks;
@@ -197,13 +206,9 @@ int main(int argc, char *argv[])
 
 #if (defined(PROVIDE_TIMING))
     if (0 == rank) {
-        auto end_train_time = hr_clock.now();
-
-        auto train_time = end_train_time - init_train_time;
-        fprintf(stdout, "%s  %7.3lf s\n", "Training time:", CHRONO_SECONDS_TO_DOUBLE(train_time));
+        end_train_time = hr_clock.now();
     }
 #endif
-
 
     // TESTING ONLY IN RANK 0
     if (rank == 0) {
@@ -243,4 +248,15 @@ int main(int argc, char *argv[])
         std::cout << "Num correct - " << num_correct << std::endl;
         std::cout << "Test Accuracy - " << 100.0 * num_correct / num_test_samples << std::endl;
     } // end rank 0
+
+
+#if (defined(PROVIDE_TIMING))
+    if (0 == rank) {
+        auto end_train_time = hr_clock.now();
+
+        auto train_time = end_train_time - init_train_time;
+        fprintf(stdout, "\nTiming report for  %ld  epochs:\n", num_epochs);
+        fprintf(stdout, "\t%s  %7.3lf s\n", "training:", CHRONO_SECONDS_TO_DOUBLE(train_time));
+    }
+#endif
 }
