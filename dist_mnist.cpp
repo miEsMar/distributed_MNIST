@@ -6,6 +6,13 @@
 #include <torch/csrc/distributed/c10d/Work.hpp>
 
 
+#define PROVIDE_TIMING
+
+#if (defined(PROVIDE_TIMING))
+# include <chrono>
+using namespace std::chrono_literals;
+#endif
+
 // Define a Convolutional Module
 struct Model : torch::nn::Module {
     Model()
@@ -91,6 +98,17 @@ int main(int argc, char *argv[])
     // Number of epochs
     size_t num_epochs = 10;
 
+#if (defined(PROVIDE_TIMING))
+    auto hr_clock        = std::chrono::high_resolution_clock();
+    auto init_train_time = hr_clock.now();
+
+    std::chrono::time_point<typeof(hr_clock), std::chrono::nanoseconds> prev, curr;
+
+    std::chrono::nanoseconds time_backward;
+    std::chrono::nanoseconds time_allreduce;
+    std::chrono::nanoseconds time_wait;
+#endif
+
     for (size_t epoch = 1; epoch <= num_epochs; ++epoch) {
         size_t num_correct = 0;
 
@@ -144,6 +162,19 @@ int main(int argc, char *argv[])
                   << std::endl;
 
     } // end epoch
+
+
+#if (defined(PROVIDE_TIMING))
+    if (0 == rank) {
+        auto end_train_time = hr_clock.now();
+
+        auto train_time = end_train_time - init_train_time;
+        fprintf(stdout, "%s%4ld.%3ld s\n", "Training time:",
+                std::chrono::duration_cast<std::chrono::seconds>(train_time).count(),
+                std::chrono::duration_cast<std::chrono::milliseconds>(train_time % 1s).count());
+    }
+#endif
+
 
     // TESTING ONLY IN RANK 0
     if (rank == 0) {
