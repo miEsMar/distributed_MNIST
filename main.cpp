@@ -13,6 +13,10 @@
 using namespace std::chrono_literals;
 #endif
 
+
+//
+
+
 // Define a Convolutional Module
 struct Model : torch::nn::Module {
     Model()
@@ -44,6 +48,8 @@ struct Model : torch::nn::Module {
     torch::nn::Linear    fc2;
 };
 
+
+#ifndef SERIALISED_VERSION
 void waitWork(c10::intrusive_ptr<c10d::ProcessGroupMPI>   pg,
               std::vector<c10::intrusive_ptr<c10d::Work>> works)
 {
@@ -56,15 +62,26 @@ void waitWork(c10::intrusive_ptr<c10d::ProcessGroupMPI>   pg,
         }
     }
 }
+#endif
+
 
 int main(int argc, char *argv[])
 {
+#ifndef SERIALISED_VERSION
     // Creating MPI Process Group
     auto pg = c10d::ProcessGroupMPI::createProcessGroupMPI();
 
     // Retrieving MPI environment variables
-    auto numranks = pg->getSize();
-    auto rank     = pg->getRank();
+    const auto numranks = pg->getSize();
+    const auto rank     = pg->getRank();
+
+    fprintf(stdout, "\n ****  DISTRIBUTED  MNIST  toy model  ****\n\n");
+#else
+    constexpr auto numranks = 1;
+    constexpr auto rank     = 0;
+
+    fprintf(stdout, "\n ****  SERIALISED   MNIST  toy model  ****\n\n");
+#endif
 
     // TRAINING
     // Read train dataset
@@ -73,42 +90,37 @@ int main(int argc, char *argv[])
                              .map(torch::data::transforms::Normalize<>(0.1307, 0.3081))
                              .map(torch::data::transforms::Stack<>());
 
+#ifndef SERIALISED_VERSION
     // Distributed Random Sampler
     auto data_sampler = torch::data::samplers::DistributedRandomSampler(
         train_dataset.size().value(), numranks, rank, false);
+#else
+    auto data_sampler = torch::data::samplers::RandomSampler(train_dataset.size().value());
+#endif
 
     auto num_train_samples_per_proc = train_dataset.size().value() / numranks;
 
     // Generate dataloader
-    auto total_batch_size = 64;
-    auto batch_size_per_proc =
+    constexpr auto total_batch_size = 64;
+    auto           batch_size_per_proc =
         total_batch_size / numranks; // effective batch size in each processor
     auto data_loader =
         torch::data::make_data_loader(std::move(train_dataset), data_sampler, batch_size_per_proc);
 
-    // setting manual seed
     torch::manual_seed(0);
 
     auto model = std::make_shared<Model>();
 
-    auto learning_rate = 1e-2;
-
+    constexpr auto    learning_rate = 1e-2;
     torch::optim::SGD optimizer(model->parameters(), learning_rate);
 
-    // Number of epochs
-    size_t num_epochs = 10;
 
 #if (defined(PROVIDE_TIMING))
     auto hr_clock        = std::chrono::high_resolution_clock();
     auto init_train_time = hr_clock.now();
-
-    std::chrono::time_point<typeof(hr_clock), std::chrono::nanoseconds> prev, curr;
-
-    std::chrono::nanoseconds time_backward;
-    std::chrono::nanoseconds time_allreduce;
-    std::chrono::nanoseconds time_wait;
 #endif
 
+    constexpr size_t num_epochs = 10;
     for (size_t epoch = 1; epoch <= num_epochs; ++epoch) {
         size_t num_correct = 0;
 
@@ -131,6 +143,7 @@ int main(int argc, char *argv[])
             // Backpropagation
             loss.backward();
 
+#ifndef SERIALISED_VERSION
             // Averaging the gradients of the parameters in all the processors
             // Note: This may lag behind DistributedDataParallel (DDP) in performance
             // since this synchronizes parameters after backward pass while DDP
@@ -148,6 +161,7 @@ int main(int argc, char *argv[])
             for (auto &param : model->named_parameters()) {
                 param.value().grad().data() = param.value().grad().data() / numranks;
             }
+#endif
 
             // Update parameters
             optimizer.step();
@@ -157,10 +171,11 @@ int main(int argc, char *argv[])
         } // end batch loader
 
         auto accuracy = 100.0 * num_correct / num_train_samples_per_proc;
-
-        std::cout << "Accuracy in rank " << rank << " in epoch " << epoch << " - " << accuracy
-                  << std::endl;
-
+        std::cout << "Accuracy "
+#ifndef SERIALISED_VERSION
+                  << "in rank " << rank
+#endif
+                  << " in epoch " << epoch << " - " << accuracy << std::endl;
     } // end epoch
 
 
