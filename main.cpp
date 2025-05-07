@@ -7,6 +7,10 @@
 # include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 # include <torch/csrc/distributed/c10d/ProcessGroupMPI.hpp>
 # include <torch/csrc/distributed/c10d/Work.hpp>
+
+# define RUN_MODE_STRING "DISTRIBUTED"
+#else
+# define RUN_MODE_STRING "SERIALISED "
 #endif
 
 
@@ -86,16 +90,13 @@ int main(int argc, char *argv[])
     // Retrieving MPI environment variables
     const auto numranks = pg->getSize();
     const auto rank     = pg->getRank();
-
-    if (0 == rank) {
-        fprintf(stdout, "\n ****  DISTRIBUTED  MNIST  toy model  ****\n\n");
-    }
 #else
     constexpr auto numranks = 1;
     constexpr auto rank     = 0;
-
-    fprintf(stdout, "\n ****  SERIALISED   MNIST  toy model  ****\n\n");
 #endif
+    if (0 == rank) {
+        fprintf(stdout, "\n ****  " RUN_MODE_STRING "  MNIST  toy model  ****\n\n");
+    }
 
     // TRAINING
     // Read train dataset
