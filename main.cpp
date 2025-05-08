@@ -1,6 +1,7 @@
 // MNIST model trainig example
 #include <iostream>
 #include <torch/csrc/api/include/torch/torch.h>
+#include <torch/csrc/distributed/c10d/Types.hpp>
 
 #ifndef SERIALISED_VERSION
 # include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
@@ -13,11 +14,22 @@
 #endif
 
 
+// Configurable options
 #define PROVIDE_TIMING
+// #define MEASURE_TORCH_BUILTIN_OVERLAP
+
+
+//
+
 
 #if (defined(PROVIDE_TIMING))
 # include <chrono>
 using namespace std::chrono_literals;
+#endif
+
+
+#if (defined(MEASURE_TORCH_BUILTIN_OVERLAP) && !(defined(SERIALISED_VERSION)))
+# define __DO_MEASURE_TORCH_BUILTIN_OVERLAP
 #endif
 
 
@@ -64,6 +76,35 @@ struct Model : torch::nn::Module {
 };
 
 
+#ifdef __DO_MEASURE_TORCH_BUILTIN_OVERLAP
+# define DIM 25
+
+static inline void dummy_cpu_compute(void)
+{
+    static volatile float a[DIM][DIM];
+    static volatile float x[DIM];
+    static volatile float y[DIM];
+
+    int i = 0, j = 0;
+    for (i = 0; i < DIM; i++)
+        for (j = 0; j < DIM; j++)
+            x[i] = x[i] + a[i][j] * a[j][i] + y[j];
+}
+
+static inline void do_cpu_computation(double target_seconds)
+{
+    double t1 = 0.0, t2 = 0.0;
+    double time_elapsed = 0.0;
+    while (time_elapsed < target_seconds) {
+        t1 = MPI_Wtime();
+        dummy_cpu_compute();
+        t2 = MPI_Wtime();
+        time_elapsed += (t2 - t1);
+    }
+}
+#endif
+
+
 int main(int argc, char *argv[])
 {
 #ifndef SERIALISED_VERSION
@@ -90,7 +131,6 @@ int main(int argc, char *argv[])
                              .map(torch::data::transforms::Stack<>());
 
 #ifndef SERIALISED_VERSION
-    // Distributed Random Sampler
     auto data_sampler = torch::data::samplers::DistributedRandomSampler(
         train_dataset.size().value(), numranks, rank, false);
 #else
@@ -119,23 +159,32 @@ int main(int argc, char *argv[])
     auto init_time       = hr_clock.now();
     auto init_train_time = init_time;
     auto end_train_time  = init_train_time;
+    auto init_test_time  = init_time;
     auto end_time        = end_train_time;
 
 # ifndef SERIALISED_VERSION
-    std::chrono::duration<double> time_allreduce_plus_wait;
-    std::chrono::duration<double> time_allreduce;
-    std::chrono::duration<double> time_dummy_compute;
-    std::chrono::duration<double> time_waitall;
+#  ifdef __DO_MEASURE_TORCH_BUILTIN_OVERLAP
+    std::chrono::duration<double> time_allreduce_plus_wait_serial(0.0);
+#  endif
+    std::chrono::duration<double> time_allreduce_plus_wait(0.0);
+    std::chrono::duration<double> time_allreduce(0.0);
+    std::chrono::duration<double> time_dummy_compute(0.0);
+    std::chrono::duration<double> time_waitall(0.0);
 # endif
 #endif
 
+    size_t           n_train_batches;
     constexpr size_t num_epochs = 10;
     for (size_t epoch = 1; epoch <= num_epochs; ++epoch) {
         size_t num_correct = 0;
 
+        n_train_batches = 0;
         for (auto &batch : *data_loader) {
             auto ip = batch.data;
             auto op = batch.target.squeeze();
+
+
+            ++n_train_batches;
 
             // convert to required formats
             ip = ip.to(torch::kF32);
@@ -158,18 +207,52 @@ int main(int argc, char *argv[])
             // since this synchronizes parameters after backward pass while DDP
             // overlaps synchronizing parameters and computing gradients in backward pass.
 
+
+            const c10d::AllreduceOptions opts = c10d::AllreduceOptions();
+
+# if (defined(PROVIDE_TIMING))
             auto ts = hr_clock.now();
+# endif
+
+# ifdef __DO_MEASURE_TORCH_BUILTIN_OVERLAP
+            {
+                for (auto &param : model->named_parameters()) {
+                    std::vector<torch::Tensor> tmp = {param.value().grad()};
+
+                    auto work = pg->allreduce(tmp, opts);
+                    work->wait();
+                }
+                time_allreduce_plus_wait_serial += hr_clock.now() - ts;
+            }
+
+#  if (defined(PROVIDE_TIMING))
+            ts = hr_clock.now();
+#  endif
+# endif
 
             std::vector<c10::intrusive_ptr<::c10d::Work>> works;
             for (auto &param : model->named_parameters()) {
-                std::vector<torch::Tensor> tmp  = {param.value().grad()};
-                auto                       ti   = hr_clock.now();
-                auto                       work = pg->allreduce(tmp);
+                std::vector<torch::Tensor> tmp = {param.value().grad()};
+# if (defined(PROVIDE_TIMING))
+                auto ti = hr_clock.now();
+# endif
+                auto work = pg->allreduce(tmp, opts);
+# if (defined(PROVIDE_TIMING))
                 time_allreduce += hr_clock.now() - ti;
+# endif
                 works.push_back(std::move(work));
             }
 
+# ifdef __DO_MEASURE_TORCH_BUILTIN_OVERLAP
+            // NOTE: compute time does not include the time need for the Allreduce calls.
+            auto time_compute = (time_allreduce_plus_wait_serial - time_allreduce);
+
+            do_cpu_computation(time_compute.count());
+# endif
+
+# if (defined(PROVIDE_TIMING))
             auto ti = hr_clock.now();
+# endif
             for (auto &work : works) {
                 try {
                     if (!work->isCompleted()) {
@@ -180,9 +263,11 @@ int main(int argc, char *argv[])
                     pg->abort();
                 }
             }
+# if (defined(PROVIDE_TIMING))
             auto te = hr_clock.now();
             time_waitall += te - ti;
             time_allreduce_plus_wait += te - ts;
+# endif
 
             for (auto &param : model->named_parameters()) {
                 param.value().grad().data() = param.value().grad().data() / numranks;
@@ -208,10 +293,13 @@ int main(int argc, char *argv[])
 #if (defined(PROVIDE_TIMING))
     if (0 == rank) {
         end_train_time = hr_clock.now();
+
+        init_test_time = end_train_time;
     }
 #endif
 
     // TESTING ONLY IN RANK 0
+    size_t n_test_batches;
     if (rank == 0) {
         auto test_dataset =
             torch::data::datasets::MNIST(kDataRoot, torch::data::datasets::MNIST::Mode::kTest)
@@ -226,9 +314,12 @@ int main(int argc, char *argv[])
 
         size_t num_correct = 0;
 
+        n_test_batches = 0;
         for (auto &batch : *test_loader) {
             auto ip = batch.data;
             auto op = batch.target.squeeze();
+
+            ++n_test_batches;
 
             // convert to required format
             ip = ip.to(torch::kF32);
@@ -253,11 +344,14 @@ int main(int argc, char *argv[])
 
 #if (defined(PROVIDE_TIMING))
     if (0 == rank) {
-        auto end_train_time = hr_clock.now();
-
+        auto test_time  = hr_clock.now() - init_test_time;
         auto train_time = end_train_time - init_train_time;
+
         fprintf(stdout, "\nTiming report for  %ld  epochs:\n", num_epochs);
-        fprintf(stdout, "\t%s  %7.3lf s\n", "training:", CHRONO_SECONDS_TO_DOUBLE(train_time));
+        fprintf(stdout, "\t%s  %7.3lf s  (%5ld batches)\n",
+                "training:", CHRONO_SECONDS_TO_DOUBLE(train_time), n_train_batches);
+        fprintf(stdout, "\t%s  %7.3lf s  (%5ld batches)\n",
+                "test:    ", CHRONO_SECONDS_TO_DOUBLE(test_time), n_test_batches);
     }
 #endif
 }
