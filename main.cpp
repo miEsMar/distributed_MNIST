@@ -16,7 +16,7 @@
 
 // Configurable options
 #define PROVIDE_TIMING
-// #define MEASURE_TORCH_BUILTIN_OVERLAP
+#define MEASURE_TORCH_BUILTIN_OVERLAP
 
 
 //
@@ -102,6 +102,18 @@ static inline void do_cpu_computation(double target_seconds)
         time_elapsed += (t2 - t1);
     }
 }
+
+
+// The closer the parallel time to the serial, the less the ovelap.
+static inline double compute_overlap(double serial, double parallel)
+{
+    double overlap = 0.0;
+    overlap        = serial - parallel;
+    if (overlap < 0.0) {
+        return 0.0;
+    }
+    return (overlap / serial) * 100.0;
+}
 #endif
 
 
@@ -122,6 +134,14 @@ int main(int argc, char *argv[])
         fprintf(stdout, "\n ****  " RUN_MODE_STRING "  MNIST  toy model  ****\n\n");
     }
 
+    // Config data
+    constexpr auto               total_batch_size = 64;
+    constexpr size_t             num_epochs       = 10;
+    constexpr auto               learning_rate    = 1e-2;
+    const c10d::AllreduceOptions opts             = c10d::AllreduceOptions();
+
+    torch::manual_seed(0);
+
 
     // Timings
 #if (defined(PROVIDE_TIMING))
@@ -133,17 +153,20 @@ int main(int argc, char *argv[])
 
 # ifndef SERIALISED_VERSION
 #  ifdef __DO_MEASURE_TORCH_BUILTIN_OVERLAP
-    std::chrono::duration<double> time_allreduce_plus_wait_serial(0.0);
-#  endif
+    std::chrono::duration<double> duration_allreduce_plus_wait_serial(0.0);
     std::chrono::duration<double> duration_allreduce_plus_wait(0.0);
     std::chrono::duration<double> duration_allreduce(0.0);
-    std::chrono::duration<double> duration_dummy_compute(0.0);
-    std::chrono::duration<double> duration_waitall(0.0);
+    std::chrono::duration<double> duration_wait(0.0);
+
+    std::vector<std::vector<double>> overlaps(num_epochs);
+#  endif
 # endif
 #endif
 
 
+    // ***********
     // TRAINING
+    // ***********
     // Read train dataset
     const char *kDataRoot     = "/home/bsc/bsc488161/mpi_offload/tests/mnist/dataset/dataset/";
     auto        train_dataset = torch::data::datasets::MNIST(kDataRoot)
@@ -151,40 +174,38 @@ int main(int argc, char *argv[])
                                                                        TENSOR_NORMALISE_OP_CST_2))
                              .map(torch::data::transforms::Stack<>());
 
+    // Generate dataloader
 #ifndef SERIALISED_VERSION
     auto data_sampler = torch::data::samplers::DistributedRandomSampler(
         train_dataset.size().value(), numranks, rank, false);
 #else
     auto data_sampler = torch::data::samplers::RandomSampler(train_dataset.size().value());
 #endif
-
     auto num_train_samples_per_proc = train_dataset.size().value() / numranks;
-
-    // Generate dataloader
-    constexpr auto total_batch_size = 64;
-    auto           batch_size_per_proc =
+    auto batch_size_per_proc =
         total_batch_size / numranks; // effective batch size in each processor
     auto data_loader =
         torch::data::make_data_loader(std::move(train_dataset), data_sampler, batch_size_per_proc);
 
-    torch::manual_seed(0);
-
+    // Create model instance
     auto model = std::make_shared<Model>();
 
-    constexpr auto    learning_rate = 1e-2;
+    // Create optimizer instance
     torch::optim::SGD optimizer(model->parameters(), learning_rate);
 
-
-    size_t           n_train_batches;
-    constexpr size_t num_epochs = 10;
+    size_t n_train_batches;
     for (size_t epoch = 1; epoch <= num_epochs; ++epoch) {
+
         size_t num_correct = 0;
+
+#ifdef __DO_MEASURE_TORCH_BUILTIN_OVERLAP
+        overlaps[epoch - 1].reserve(1000);
+#endif
 
         n_train_batches = 0;
         for (auto &batch : *data_loader) {
             auto ip = batch.data;
             auto op = batch.target.squeeze();
-
 
             ++n_train_batches;
 
@@ -204,42 +225,36 @@ int main(int argc, char *argv[])
             loss.backward();
 
 #ifndef SERIALISED_VERSION
-            // Averaging the gradients of the parameters in all the processors
-            // Note: This may lag behind DistributedDataParallel (DDP) in performance
-            // since this synchronizes parameters after backward pass while DDP
-            // overlaps synchronizing parameters and computing gradients in backward pass.
-
-
-            const c10d::AllreduceOptions opts = c10d::AllreduceOptions();
-
 # if (defined(PROVIDE_TIMING))
             auto ts = hr_clock.now();
 # endif
 
 # ifdef __DO_MEASURE_TORCH_BUILTIN_OVERLAP
-            {
-                for (auto &param : model->named_parameters()) {
-                    std::vector<torch::Tensor> tmp = {param.value().grad()};
+            for (auto &param : model->named_parameters()) {
+                std::vector<torch::Tensor> tmp = {param.value().grad()};
 
-                    auto work = pg->allreduce(tmp, opts);
-                    work->wait();
-                }
-                time_allreduce_plus_wait_serial += hr_clock.now() - ts;
+                auto work = pg->allreduce(tmp, opts);
+                work->wait();
             }
+            // NOTE: do not increment this since batch size might vary
+            duration_allreduce_plus_wait_serial = hr_clock.now() - ts;
 
-#  if (defined(PROVIDE_TIMING))
+            // Restore start time
             ts = hr_clock.now();
-#  endif
 # endif
 
+            // Averaging the gradients of the parameters in all the processors
+            // Note: This may lag behind DistributedDataParallel (DDP) in performance
+            // since this synchronizes parameters after backward pass while DDP
+            // overlaps synchronizing parameters and computing gradients in backward pass.
             std::vector<c10::intrusive_ptr<::c10d::Work>> works;
             for (auto &param : model->named_parameters()) {
                 std::vector<torch::Tensor> tmp = {param.value().grad()};
-# if (defined(PROVIDE_TIMING))
+# ifdef __DO_MEASURE_TORCH_BUILTIN_OVERLAP
                 auto ti = hr_clock.now();
 # endif
                 auto work = pg->allreduce(tmp, opts);
-# if (defined(PROVIDE_TIMING))
+# ifdef __DO_MEASURE_TORCH_BUILTIN_OVERLAP
                 duration_allreduce += hr_clock.now() - ti;
 # endif
                 works.push_back(std::move(work));
@@ -247,34 +262,34 @@ int main(int argc, char *argv[])
 
 # ifdef __DO_MEASURE_TORCH_BUILTIN_OVERLAP
             // NOTE: compute time does not include the time need for the Allreduce calls.
-            auto time_compute = (time_allreduce_plus_wait_serial - time_allreduce);
+            auto duration_wait_serial = (duration_allreduce_plus_wait_serial - duration_allreduce);
+            do_cpu_computation(duration_wait_serial.count());
 
-            do_cpu_computation(time_compute.count());
-# endif
-
-# if (defined(PROVIDE_TIMING))
             auto ti = hr_clock.now();
 # endif
+
             for (auto &work : works) {
                 try {
-                    if (!work->isCompleted()) {
-                        work->wait();
-                    }
+                    work->wait();
                 } catch (const std::exception &ex) {
                     std::cerr << "Exception received: " << ex.what() << std::endl;
                     pg->abort();
                 }
             }
-# if (defined(PROVIDE_TIMING))
-            auto te = hr_clock.now();
-            duration_waitall += te - ti;
-            duration_allreduce_plus_wait += te - ts;
+
+# ifdef __DO_MEASURE_TORCH_BUILTIN_OVERLAP
+            auto te                      = hr_clock.now();
+            duration_wait                = te - ti;
+            duration_allreduce_plus_wait = te - ts;
+
+            overlaps[epoch - 1].emplace_back(
+                compute_overlap(duration_wait_serial.count(), duration_wait.count()));
 # endif
 
             for (auto &param : model->named_parameters()) {
                 param.value().grad().data() = param.value().grad().data() / numranks;
             }
-#endif
+#endif // SERIALISED_VERSION
 
             // Update parameters
             optimizer.step();
@@ -291,7 +306,6 @@ int main(int argc, char *argv[])
                   << " in epoch " << epoch << " - " << accuracy << std::endl;
     } // end epoch
 
-
 #if (defined(PROVIDE_TIMING))
     if (0 == rank) {
         time_train_end = hr_clock.now();
@@ -300,7 +314,10 @@ int main(int argc, char *argv[])
     }
 #endif
 
-    // TESTING ONLY IN RANK 0
+
+    // **********************
+    // TRAINING (ONLY RANK 0)
+    // **********************
     size_t n_test_batches;
     if (rank == 0) {
         auto test_dataset =
@@ -346,10 +363,20 @@ int main(int argc, char *argv[])
         auto train_time = time_train_end - time_train_init;
 
         fprintf(stdout, "\nTiming report for  %ld  epochs:\n", num_epochs);
-        fprintf(stdout, "\t%s  %7.3lf s  (%5ld batches)\n",
+        fprintf(stdout, "\t%-12s %7.3lf s  (%5ld batches)\n",
                 "training:", CHRONO_SECONDS_TO_DOUBLE(train_time), n_train_batches);
-        fprintf(stdout, "\t%s  %7.3lf s  (%5ld batches)\n",
-                "test:    ", CHRONO_SECONDS_TO_DOUBLE(test_time), n_test_batches);
+        fprintf(stdout, "\t%-12s %7.3lf s  (%5ld batches)\n",
+                "test:", CHRONO_SECONDS_TO_DOUBLE(test_time), n_test_batches);
+# ifdef __DO_MEASURE_TORCH_BUILTIN_OVERLAP
+        double avg_overlap = 0.0;
+        for (size_t i = 0; i < num_epochs; ++i) {
+            for (size_t j = 0; j < n_train_batches; ++j) {
+                avg_overlap += overlaps[i][j];
+            }
+        }
+        avg_overlap /= (num_epochs * n_train_batches);
+        fprintf(stdout, "\t%-12s %7.3lf %%\n", "overlap:", avg_overlap);
+# endif
     }
 #endif
 }
