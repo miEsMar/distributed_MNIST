@@ -84,7 +84,7 @@ int main(int argc, char *argv[])
 
     // TRAINING
     // Read train dataset
-    const char *kDataRoot     = "./dataset/dataset/";
+    const char *kDataRoot     = "/home/bsc/bsc488161/mpi_offload/tests/mnist/dataset/dataset/";
     auto        train_dataset = torch::data::datasets::MNIST(kDataRoot)
                              .map(torch::data::transforms::Normalize<>(TENSOR_NORMALISE_OP_CST_1,
                                                                        TENSOR_NORMALISE_OP_CST_2))
