@@ -122,6 +122,27 @@ int main(int argc, char *argv[])
         fprintf(stdout, "\n ****  " RUN_MODE_STRING "  MNIST  toy model  ****\n\n");
     }
 
+
+    // Timings
+#if (defined(PROVIDE_TIMING))
+    auto hr_clock        = std::chrono::high_resolution_clock();
+    auto time_init       = hr_clock.now();
+    auto time_train_init = time_init;
+    auto time_train_end  = time_train_init;
+    auto time_test_init  = time_init;
+
+# ifndef SERIALISED_VERSION
+#  ifdef __DO_MEASURE_TORCH_BUILTIN_OVERLAP
+    std::chrono::duration<double> time_allreduce_plus_wait_serial(0.0);
+#  endif
+    std::chrono::duration<double> duration_allreduce_plus_wait(0.0);
+    std::chrono::duration<double> duration_allreduce(0.0);
+    std::chrono::duration<double> duration_dummy_compute(0.0);
+    std::chrono::duration<double> duration_waitall(0.0);
+# endif
+#endif
+
+
     // TRAINING
     // Read train dataset
     const char *kDataRoot     = "/home/bsc/bsc488161/mpi_offload/tests/mnist/dataset/dataset/";
@@ -153,25 +174,6 @@ int main(int argc, char *argv[])
     constexpr auto    learning_rate = 1e-2;
     torch::optim::SGD optimizer(model->parameters(), learning_rate);
 
-
-#if (defined(PROVIDE_TIMING))
-    auto hr_clock        = std::chrono::high_resolution_clock();
-    auto init_time       = hr_clock.now();
-    auto init_train_time = init_time;
-    auto end_train_time  = init_train_time;
-    auto init_test_time  = init_time;
-    auto end_time        = end_train_time;
-
-# ifndef SERIALISED_VERSION
-#  ifdef __DO_MEASURE_TORCH_BUILTIN_OVERLAP
-    std::chrono::duration<double> time_allreduce_plus_wait_serial(0.0);
-#  endif
-    std::chrono::duration<double> time_allreduce_plus_wait(0.0);
-    std::chrono::duration<double> time_allreduce(0.0);
-    std::chrono::duration<double> time_dummy_compute(0.0);
-    std::chrono::duration<double> time_waitall(0.0);
-# endif
-#endif
 
     size_t           n_train_batches;
     constexpr size_t num_epochs = 10;
@@ -238,7 +240,7 @@ int main(int argc, char *argv[])
 # endif
                 auto work = pg->allreduce(tmp, opts);
 # if (defined(PROVIDE_TIMING))
-                time_allreduce += hr_clock.now() - ti;
+                duration_allreduce += hr_clock.now() - ti;
 # endif
                 works.push_back(std::move(work));
             }
@@ -265,8 +267,8 @@ int main(int argc, char *argv[])
             }
 # if (defined(PROVIDE_TIMING))
             auto te = hr_clock.now();
-            time_waitall += te - ti;
-            time_allreduce_plus_wait += te - ts;
+            duration_waitall += te - ti;
+            duration_allreduce_plus_wait += te - ts;
 # endif
 
             for (auto &param : model->named_parameters()) {
@@ -292,9 +294,9 @@ int main(int argc, char *argv[])
 
 #if (defined(PROVIDE_TIMING))
     if (0 == rank) {
-        end_train_time = hr_clock.now();
+        time_train_end = hr_clock.now();
 
-        init_test_time = end_train_time;
+        time_test_init = time_train_end;
     }
 #endif
 
@@ -326,15 +328,11 @@ int main(int argc, char *argv[])
             op = op.to(torch::kLong);
 
             auto prediction = model->forward(ip);
-
-            auto loss = torch::nll_loss(torch::log_softmax(prediction, 1), op);
-
-            std::cout << "Test loss - " << loss.item<float>() << std::endl;
-
-            auto guess = prediction.argmax(1);
-
+            auto loss       = torch::nll_loss(torch::log_softmax(prediction, 1), op);
+            auto guess      = prediction.argmax(1);
             num_correct += torch::sum(guess.eq_(op)).item<int64_t>();
 
+            std::cout << "Test loss - " << loss.item<float>() << std::endl;
         } // end test loader
 
         std::cout << "Num correct - " << num_correct << std::endl;
@@ -344,8 +342,8 @@ int main(int argc, char *argv[])
 
 #if (defined(PROVIDE_TIMING))
     if (0 == rank) {
-        auto test_time  = hr_clock.now() - init_test_time;
-        auto train_time = end_train_time - init_train_time;
+        auto test_time  = hr_clock.now() - time_test_init;
+        auto train_time = time_train_end - time_train_init;
 
         fprintf(stdout, "\nTiming report for  %ld  epochs:\n", num_epochs);
         fprintf(stdout, "\t%s  %7.3lf s  (%5ld batches)\n",
