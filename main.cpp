@@ -3,7 +3,6 @@
 #include <torch/csrc/api/include/torch/torch.h>
 
 #ifndef SERIALISED_VERSION
-# define USE_C10D_MPI
 # include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 # include <torch/csrc/distributed/c10d/ProcessGroupMPI.hpp>
 # include <torch/csrc/distributed/c10d/Work.hpp>
@@ -173,7 +172,9 @@ int main(int argc, char *argv[])
             auto ti = hr_clock.now();
             for (auto &work : works) {
                 try {
-                    work->wait();
+                    if (!work->isCompleted()) {
+                        work->wait();
+                    }
                 } catch (const std::exception &ex) {
                     std::cerr << "Exception received: " << ex.what() << std::endl;
                     pg->abort();
