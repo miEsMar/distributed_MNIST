@@ -135,7 +135,7 @@ int main(int argc, char *argv[])
     }
 
     // Config data
-    constexpr auto               total_batch_size = 64;
+    const auto                   total_batch_size = 64 * numranks;
     constexpr size_t             num_epochs       = 10;
     constexpr auto               learning_rate    = 1e-2;
     const c10d::AllreduceOptions opts             = c10d::AllreduceOptions();
@@ -238,6 +238,11 @@ int main(int argc, char *argv[])
             }
             // NOTE: do not increment this since batch size might vary
             duration_allreduce_plus_wait_serial = hr_clock.now() - ts;
+
+            // NOTE: also duplicate averaging, to not alter next reduction operation
+            for (auto &param : model->named_parameters()) {
+                param.value().grad().data() = param.value().grad().data() / numranks;
+            }
 
             // Restore start time
             ts = hr_clock.now();
