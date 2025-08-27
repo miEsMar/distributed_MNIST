@@ -16,7 +16,7 @@
 
 // Configurable options
 #define PROVIDE_TIMING
-#define MEASURE_TORCH_BUILTIN_OVERLAP
+// #define MEASURE_TORCH_BUILTIN_OVERLAP
 
 
 //
